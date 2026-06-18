@@ -30,6 +30,7 @@ jobs:
           IMAP_USER:         ${{ secrets.IMAP_USER }}
           IMAP_PASS:         ${{ secrets.IMAP_PASS }}
           IMAP_FOLDER:       ${{ secrets.IMAP_FOLDER }}
+          GMAIL_RAW_SEARCH:  ${{ secrets.GMAIL_RAW_SEARCH }}
           PROCESSED_FOLDER:  ${{ secrets.PROCESSED_FOLDER }}
           WP_URL:            ${{ secrets.WP_URL }}
           WP_USER:           ${{ secrets.WP_USER }}
