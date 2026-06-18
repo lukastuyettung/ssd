@@ -22,23 +22,30 @@ from email.header import decode_header
 import requests
 
 # ---------- Cấu hình lấy từ biến môi trường (GitHub Secrets) ----------
-IMAP_HOST       = os.environ["IMAP_HOST"]
-IMAP_USER       = os.environ["IMAP_USER"]
+def _env(key, default=""):
+    # GitHub luôn truyền biến vào, secret không khai báo sẽ thành chuỗi rỗng.
+    # Nên phải tự quy về mặc định khi rỗng, không dùng được mặc định của os.environ.get.
+    v = os.environ.get(key, "")
+    v = v.strip() if v else ""
+    return v if v else default
+
+IMAP_HOST       = os.environ["IMAP_HOST"].strip()
+IMAP_USER       = os.environ["IMAP_USER"].strip()
 IMAP_PASS       = os.environ["IMAP_PASS"]
-IMAP_FOLDER     = os.environ.get("IMAP_FOLDER", "INBOX")
-PROCESSED_FOLDER = os.environ.get("PROCESSED_FOLDER", "")  # ví dụ "Done", để trống thì chỉ đánh dấu đã đọc
+IMAP_FOLDER     = _env("IMAP_FOLDER", "INBOX")
+PROCESSED_FOLDER = _env("PROCESSED_FOLDER", "")  # ví dụ "Done", để trống thì chỉ đánh dấu đã đọc
 
-WP_URL          = os.environ["WP_URL"].rstrip("/")
-WP_USER         = os.environ["WP_USER"]
-WP_APP_PASSWORD = os.environ["WP_APP_PASSWORD"]
-WP_CATEGORY_ID  = os.environ.get("WP_CATEGORY_ID", "").strip()
-POST_STATUS     = os.environ.get("POST_STATUS", "publish")  # publish | draft
+WP_URL          = os.environ["WP_URL"].strip().rstrip("/")
+WP_USER         = os.environ["WP_USER"].strip()
+WP_APP_PASSWORD = os.environ["WP_APP_PASSWORD"]  # không strip vì app password của WP có dấu cách
+WP_CATEGORY_ID  = _env("WP_CATEGORY_ID", "")
+POST_STATUS     = _env("POST_STATUS", "publish")  # publish | draft
 
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "").strip()
-ANTHROPIC_MODEL   = os.environ.get("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
-AI_CLEANUP        = os.environ.get("AI_CLEANUP", "true").lower() == "true" and bool(ANTHROPIC_API_KEY)
+ANTHROPIC_API_KEY = _env("ANTHROPIC_API_KEY", "")
+ANTHROPIC_MODEL   = _env("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
+AI_CLEANUP        = _env("AI_CLEANUP", "true").lower() == "true" and bool(ANTHROPIC_API_KEY)
 
-DRY_RUN = os.environ.get("DRY_RUN", "false").lower() == "true"  # bật khi test: không đăng, không đánh dấu
+DRY_RUN = _env("DRY_RUN", "false").lower() == "true"  # bật khi test: không đăng, không đánh dấu
 
 WP_AUTH = (WP_USER, WP_APP_PASSWORD)
 EXT_BY_TYPE = {
