@@ -1,0 +1,297 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+press_to_wp.py
+Mỗi ngày một lần: đọc hộp mail riêng, lấy các thông cáo báo chí,
+upload ảnh inline lên Media Library của WordPress, dọn nhẹ phần rác
+của mail forward (tùy chọn, bằng Claude), rồi đăng bài.
+
+Trạng thái "đã xử lý" không nằm trong script, mà nằm ngay trong hộp mail:
+mail nào làm xong thì đánh dấu đã đọc (và dời sang folder Done nếu khai báo),
+nên mỗi lần chạy chỉ nhìn thấy mail mới. Máy ảo của GitHub quên hết là chuyện
+bình thường, hộp mail mới là cuốn sổ ghi nhớ.
+"""
+
+import os
+import re
+import sys
+import imaplib
+from email import message_from_bytes
+from email.header import decode_header
+
+import requests
+
+# ---------- Cấu hình lấy từ biến môi trường (GitHub Secrets) ----------
+IMAP_HOST       = os.environ["IMAP_HOST"]
+IMAP_USER       = os.environ["IMAP_USER"]
+IMAP_PASS       = os.environ["IMAP_PASS"]
+IMAP_FOLDER     = os.environ.get("IMAP_FOLDER", "INBOX")
+PROCESSED_FOLDER = os.environ.get("PROCESSED_FOLDER", "")  # ví dụ "Done", để trống thì chỉ đánh dấu đã đọc
+
+WP_URL          = os.environ["WP_URL"].rstrip("/")
+WP_USER         = os.environ["WP_USER"]
+WP_APP_PASSWORD = os.environ["WP_APP_PASSWORD"]
+WP_CATEGORY_ID  = os.environ.get("WP_CATEGORY_ID", "").strip()
+POST_STATUS     = os.environ.get("POST_STATUS", "publish")  # publish | draft
+
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+ANTHROPIC_MODEL   = os.environ.get("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
+AI_CLEANUP        = os.environ.get("AI_CLEANUP", "true").lower() == "true" and bool(ANTHROPIC_API_KEY)
+
+DRY_RUN = os.environ.get("DRY_RUN", "false").lower() == "true"  # bật khi test: không đăng, không đánh dấu
+
+WP_AUTH = (WP_USER, WP_APP_PASSWORD)
+EXT_BY_TYPE = {
+    "image/jpeg": ".jpg", "image/jpg": ".jpg", "image/png": ".png",
+    "image/gif": ".gif", "image/webp": ".webp", "image/bmp": ".bmp",
+}
+
+
+# ---------- Tiện ích ----------
+def log(*a):
+    print(*a, flush=True)
+
+
+def decode_mime(s):
+    """Giải mã header dạng =?utf-8?...?= thành chuỗi đọc được."""
+    if not s:
+        return ""
+    out = ""
+    for text, enc in decode_header(s):
+        if isinstance(text, bytes):
+            out += text.decode(enc or "utf-8", errors="replace")
+        else:
+            out += text
+    return out
+
+
+def clean_title(subject):
+    """Bỏ tiền tố Fwd:/Re:/Fw: lặp lại ở đầu tiêu đề."""
+    return re.sub(r"^(\s*(fwd|fw|re)\s*:\s*)+", "", subject, flags=re.I).strip()
+
+
+def strip_tags(html):
+    return re.sub(r"<[^>]+>", "", html or "").strip()
+
+
+def ensure_ext(filename, ctype):
+    if filename and "." in filename:
+        return filename
+    base = filename or "image"
+    return base + EXT_BY_TYPE.get(ctype, ".bin")
+
+
+# ---------- WordPress ----------
+def wp_upload_media(filename, data, ctype):
+    r = requests.post(
+        f"{WP_URL}/wp-json/wp/v2/media",
+        auth=WP_AUTH,
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Type": ctype,
+        },
+        data=data,
+        timeout=120,
+    )
+    r.raise_for_status()
+    j = r.json()
+    return j["id"], j["source_url"]
+
+
+def wp_create_post(title, content, status, featured_media, category_id):
+    payload = {"title": title, "content": content, "status": status}
+    if featured_media:
+        payload["featured_media"] = featured_media
+    if category_id:
+        payload["categories"] = [int(category_id)]
+    r = requests.post(
+        f"{WP_URL}/wp-json/wp/v2/posts",
+        auth=WP_AUTH,
+        json=payload,
+        timeout=60,
+    )
+    r.raise_for_status()
+    return r.json().get("link", "(không lấy được link)")
+
+
+# ---------- Bóc email ----------
+def parse_email(msg):
+    """Trả về (html_body, inline_images, attachments)."""
+    html_body = None
+    text_body = None
+    inline_images = {}   # cid -> (filename, data, ctype)
+    attachments = []     # (filename, data, ctype)
+
+    for part in msg.walk():
+        if part.is_multipart():
+            continue
+        ctype = (part.get_content_type() or "").lower()
+        cdisp = str(part.get("Content-Disposition") or "").lower()
+        payload = part.get_payload(decode=True)
+        if payload is None:
+            continue
+
+        if ctype == "text/html" and "attachment" not in cdisp and html_body is None:
+            charset = part.get_content_charset() or "utf-8"
+            html_body = payload.decode(charset, errors="replace")
+        elif ctype == "text/plain" and "attachment" not in cdisp and text_body is None:
+            charset = part.get_content_charset() or "utf-8"
+            text_body = payload.decode(charset, errors="replace")
+        elif ctype.startswith("image/"):
+            fname = ensure_ext(decode_mime(part.get_filename()), ctype)
+            cid = part.get("Content-ID")
+            if cid:
+                inline_images[cid.strip("<>")] = (fname, payload, ctype)
+            else:
+                attachments.append((fname, payload, ctype))
+
+    if html_body is None and text_body is not None:
+        # không có HTML thì gói tạm text vào thẻ p
+        safe = text_body.replace("\n", "<br>\n")
+        html_body = f"<p>{safe}</p>"
+
+    return html_body, inline_images, attachments
+
+
+def remap_inline_images(html, inline_images):
+    """Upload từng ảnh inline, thay cid: bằng URL thật. Trả về (html, featured_media_id)."""
+    featured = None
+    for cid, (fname, data, ctype) in inline_images.items():
+        try:
+            media_id, url = wp_upload_media(fname, data, ctype)
+        except Exception as e:
+            log(f"   ! upload ảnh inline {fname} lỗi, bỏ qua: {e}")
+            continue
+        if featured is None:
+            featured = media_id
+        # thay cả dạng đầy đủ lẫn dạng rút gọn phần trước @ phòng khi client cắt bớt
+        html = html.replace(f"cid:{cid}", url)
+        local = cid.split("@")[0]
+        if local != cid:
+            html = html.replace(f"cid:{local}", url)
+    return html, featured
+
+
+def append_attached_images(html, attachments, featured):
+    """Ảnh đính kèm rời (không inline) thì upload và chèn xuống cuối bài."""
+    for fname, data, ctype in attachments:
+        try:
+            media_id, url = wp_upload_media(fname, data, ctype)
+        except Exception as e:
+            log(f"   ! upload ảnh đính kèm {fname} lỗi, bỏ qua: {e}")
+            continue
+        if featured is None:
+            featured = media_id
+        html += f'\n<figure><img src="{url}" alt=""/></figure>'
+    return html, featured
+
+
+# ---------- Dọn nhẹ bằng Claude (tùy chọn, có van an toàn) ----------
+def ai_cleanup(html):
+    if not AI_CLEANUP:
+        return html
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        instruction = (
+            "Đây là phần thân HTML của một email thông cáo báo chí đã được forward. "
+            "Hãy bỏ phần header forward (kiểu '---------- Forwarded message ----------'), "
+            "bỏ chữ ký, bỏ các dòng trích dẫn lại của mail cũ, và bỏ phần chân email hệ thống. "
+            "TUYỆT ĐỐI không được viết lại, tóm tắt hay đổi câu chữ của nội dung thông cáo. "
+            "Giữ nguyên mọi thẻ <img> cùng thuộc tính src. "
+            "Chỉ trả về HTML đã dọn, không thêm lời nào, không bọc trong dấu nháy code.\n\n"
+            "HTML:\n"
+        )
+        resp = client.messages.create(
+            model=ANTHROPIC_MODEL,
+            max_tokens=8000,
+            messages=[{"role": "user", "content": instruction + html}],
+        )
+        cleaned = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text").strip()
+        cleaned = re.sub(r"^```(?:html)?\s*", "", cleaned)
+        cleaned = re.sub(r"\s*```$", "", cleaned).strip()
+
+        # Van an toàn: nếu model làm rỗng nội dung hoặc đánh rơi ảnh thì giữ bản gốc
+        if len(cleaned) < 0.3 * len(html):
+            log("   ! AI trả về quá ngắn, giữ bản gốc")
+            return html
+        if "<img" in html and "<img" not in cleaned:
+            log("   ! AI làm mất ảnh, giữ bản gốc")
+            return html
+        return cleaned
+    except Exception as e:
+        log(f"   ! Bước AI lỗi, giữ bản gốc: {e}")
+        return html
+
+
+# ---------- IMAP ----------
+def mark_processed(imap, uid):
+    if DRY_RUN:
+        return
+    imap.uid("STORE", uid, "+FLAGS", r"(\Seen)")
+    if PROCESSED_FOLDER:
+        res, _ = imap.uid("COPY", uid, PROCESSED_FOLDER)
+        if res == "OK":
+            imap.uid("STORE", uid, "+FLAGS", r"(\Deleted)")
+            imap.expunge()
+
+
+def main():
+    imap = imaplib.IMAP4_SSL(IMAP_HOST)
+    imap.login(IMAP_USER, IMAP_PASS)
+    imap.select(IMAP_FOLDER)
+
+    typ, data = imap.uid("SEARCH", None, "UNSEEN")
+    uids = data[0].split() if data and data[0] else []
+    log(f"Tìm thấy {len(uids)} mail mới trong '{IMAP_FOLDER}'."
+        + (" [DRY_RUN]" if DRY_RUN else ""))
+
+    published = drafted = failed = 0
+
+    for uid in uids:
+        try:
+            typ, msg_data = imap.uid("FETCH", uid, "(RFC822)")
+            raw = msg_data[0][1]
+            msg = message_from_bytes(raw)
+
+            title = clean_title(decode_mime(msg.get("Subject")))
+            html, inline, attach = parse_email(msg)
+            html = html or ""
+
+            html, featured = remap_inline_images(html, inline)
+            html, featured = append_attached_images(html, attach, featured)
+            html = ai_cleanup(html)
+
+            # Van an toàn: thiếu tiêu đề hoặc thân quá ngắn thì hạ về draft
+            status = POST_STATUS
+            if not title or len(strip_tags(html)) < 20:
+                status = "draft"
+                log(f" - '{title or '(không tiêu đề)'}' nghi lỗi parse, hạ về draft")
+
+            if DRY_RUN:
+                log(f" - [DRY] sẽ đăng ({status}): {title[:70]}  | {len(inline)} ảnh inline, {len(attach)} đính kèm")
+            else:
+                link = wp_create_post(title, html, status, featured, WP_CATEGORY_ID)
+                log(f" - đã đăng ({status}): {title[:70]}  -> {link}")
+
+            mark_processed(imap, uid)
+            if status == "publish":
+                published += 1
+            else:
+                drafted += 1
+
+        except Exception as e:
+            failed += 1
+            log(f" ! Mail uid {uid} lỗi, bỏ qua, KHÔNG đánh dấu đã đọc: {e}")
+            # cố tình không mark_processed để mai chạy lại
+
+    imap.close()
+    imap.logout()
+    log(f"Xong. Đăng: {published}, draft: {drafted}, lỗi: {failed}.")
+    # nếu có lỗi thì để job đỏ cho dễ thấy, nhưng không chặn các mail đã xong
+    if failed and not published and not drafted:
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
