@@ -15,6 +15,7 @@ bình thường, hộp mail mới là cuốn sổ ghi nhớ.
 import os
 import re
 import sys
+import json
 import imaplib
 from email import message_from_bytes
 from email.header import decode_header
@@ -47,9 +48,17 @@ WP_APP_PASSWORD = os.environ["WP_APP_PASSWORD"]  # không strip vì app password
 WP_CATEGORY_ID  = _env("WP_CATEGORY_ID", "")
 POST_STATUS     = _env("POST_STATUS", "publish")  # publish | draft
 
+# Ảnh inline/đính kèm nhỏ hơn ngưỡng này gần như chắc là logo, icon, chữ ký,
+# nên bỏ đi. Tăng lên nếu logo agency vẫn lọt, giảm xuống nếu lỡ rớt ảnh thật.
+MIN_IMAGE_BYTES = int(_env("MIN_IMAGE_BYTES", "20000"))
+
 ANTHROPIC_API_KEY = _env("ANTHROPIC_API_KEY", "")
-ANTHROPIC_MODEL   = _env("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
+ANTHROPIC_MODEL   = _env("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 AI_CLEANUP        = _env("AI_CLEANUP", "true").lower() == "true" and bool(ANTHROPIC_API_KEY)
+
+# Khi bài chỉ có ảnh nằm ngoài (Drive...) mà không nhúng được ảnh nào, hạ về draft
+# để Lukas tự bỏ ảnh vào trước khi xuất bản. Đặt "false" nếu vẫn muốn đăng thẳng.
+DRAFT_WHEN_IMAGES_EXTERNAL = _env("DRAFT_WHEN_IMAGES_EXTERNAL", "true").lower() == "true"
 
 DRY_RUN = _env("DRY_RUN", "false").lower() == "true"  # bật khi test: không đăng, không đánh dấu
 
@@ -166,10 +175,42 @@ def parse_email(msg):
     return html_body, inline_images, attachments
 
 
+HEADER_LABELS = r"(?:Từ|From|Ngày|Date|Sent|Đã gửi|Subject|Tiêu đề|To|Đến|Gửi|Cc|Bcc)"
+
+
+def strip_forward_wrapper(html):
+    """Cắt phần đầu của mail forward: lời chào, chữ ký người gửi đi, dòng
+    'Forwarded message' và mấy dòng Từ/Date/Subject/To trích dẫn ngay sau đó.
+    Phần thân thông cáo thật nằm bên dưới nên được giữ lại."""
+    if not html:
+        return html
+    m = re.search(r"-*\s*forwarded message\s*-*", html, flags=re.I)
+    if m:
+        html = html[m.end():]
+    # bóc từng dòng tiêu đề mail trích dẫn ở đầu, tối đa vài dòng liên tiếp
+    for _ in range(8):
+        new = re.sub(
+            r"^\s*(?:<[^>]+>\s*)*" + HEADER_LABELS + r"\s*:.*?(?:<br\s*/?>|</div>|</p>|\n|$)",
+            "", html, count=1, flags=re.I | re.S,
+        )
+        if new == html:
+            break
+        html = new
+    return html.strip()
+
+
 def remap_inline_images(html, inline_images):
     """Upload từng ảnh inline, thay cid: bằng URL thật. Trả về (html, featured_media_id)."""
     featured = None
     for cid, (fname, data, ctype) in inline_images.items():
+        if len(data) < MIN_IMAGE_BYTES:
+            # ảnh nhỏ, gần như chắc là logo/chữ ký: gỡ luôn thẻ img ra khỏi bài
+            html = re.sub(rf"<img[^>]*cid:{re.escape(cid)}[^>]*>", "", html, flags=re.I)
+            local = cid.split("@")[0]
+            if local != cid:
+                html = re.sub(rf"<img[^>]*cid:{re.escape(local)}[^>]*>", "", html, flags=re.I)
+            log(f"   . bỏ ảnh nhỏ (nghi logo/chữ ký): {fname} {len(data)}B")
+            continue
         try:
             media_id, url = wp_upload_media(fname, data, ctype)
         except Exception as e:
@@ -188,6 +229,9 @@ def remap_inline_images(html, inline_images):
 def append_attached_images(html, attachments, featured):
     """Ảnh đính kèm rời (không inline) thì upload và chèn xuống cuối bài."""
     for fname, data, ctype in attachments:
+        if len(data) < MIN_IMAGE_BYTES:
+            log(f"   . bỏ ảnh đính kèm nhỏ (nghi logo): {fname} {len(data)}B")
+            continue
         try:
             media_id, url = wp_upload_media(fname, data, ctype)
         except Exception as e:
@@ -199,42 +243,59 @@ def append_attached_images(html, attachments, featured):
     return html, featured
 
 
-# ---------- Dọn nhẹ bằng Claude (tùy chọn, có van an toàn) ----------
-def ai_cleanup(html):
+# ---------- Xử lý bằng Claude: bóc nội dung + nhận diện ảnh ngoài ----------
+def ai_extract(subject, html):
+    """Giao thân email cho Claude, nhận về tiêu đề sạch, nội dung sạch và
+    danh sách link ảnh ngoài (Drive...). Trả về dict, hoặc None nếu không dùng được."""
     if not AI_CLEANUP:
-        return html
+        return None
     try:
         import anthropic
         client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
         instruction = (
-            "Đây là phần thân HTML của một email thông cáo báo chí đã được forward. "
-            "Hãy bỏ phần header forward (kiểu '---------- Forwarded message ----------'), "
-            "bỏ chữ ký, bỏ các dòng trích dẫn lại của mail cũ, và bỏ phần chân email hệ thống. "
-            "TUYỆT ĐỐI không được viết lại, tóm tắt hay đổi câu chữ của nội dung thông cáo. "
-            "Giữ nguyên mọi thẻ <img> cùng thuộc tính src. "
-            "Chỉ trả về HTML đã dọn, không thêm lời nào, không bọc trong dấu nháy code.\n\n"
-            "HTML:\n"
+            "Bạn nhận phần thân HTML của một email thông cáo báo chí đã được forward. "
+            "Nhiệm vụ: bóc ra đúng nội dung thông cáo để đăng web.\n\n"
+            "PHẢI loại bỏ những thứ không thuộc nội dung thông cáo:\n"
+            "- Lời chào và chữ ký của người forward (vd 'Thank you and best regards', tên người gửi đi).\n"
+            "- Dòng 'Forwarded message' và các dòng Từ/From, Date, Subject, To.\n"
+            "- Lời chào mở đầu của bên phát thông cáo (vd 'Thân gửi anh chị em', 'Anh/Chị nhà báo thân mến').\n"
+            "- Câu mời hỗ trợ truyền thông và lời cảm ơn xã giao (vd 'Rất mong anh chị hỗ trợ', 'Xin chân thành cảm ơn').\n"
+            "- Chữ ký, thông tin liên hệ, chức danh, số điện thoại, logo của bên phát thông cáo ở cuối.\n"
+            "- Nếu đầu thư có một danh sách vài tiêu đề gợi ý đặt tít, hãy chọn một làm tiêu đề và bỏ danh sách đó khỏi thân.\n\n"
+            "TUYỆT ĐỐI không viết lại, tóm tắt hay đổi câu chữ của phần nội dung thông cáo. "
+            "Giữ nguyên các thẻ <img> cùng src đang có trong HTML.\n"
+            "Nếu trong thư có link tới ảnh ngoài (Google Drive, Dropbox, link tải ảnh...), "
+            "hãy bỏ dòng chứa link đó khỏi nội dung và liệt kê link vào external_image_links.\n\n"
+            "Trả về DUY NHẤT một JSON, không thêm chữ nào, không bọc trong nháy code:\n"
+            '{"title": "...", "content_html": "...", "external_image_links": ["..."]}\n\n'
+            f"Tiêu đề email gốc: {subject}\n\nHTML:\n{html}"
         )
         resp = client.messages.create(
             model=ANTHROPIC_MODEL,
             max_tokens=8000,
-            messages=[{"role": "user", "content": instruction + html}],
+            messages=[{"role": "user", "content": instruction}],
         )
-        cleaned = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text").strip()
-        cleaned = re.sub(r"^```(?:html)?\s*", "", cleaned)
-        cleaned = re.sub(r"\s*```$", "", cleaned).strip()
+        raw = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text").strip()
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw).strip()
+        data = json.loads(raw)
 
-        # Van an toàn: nếu model làm rỗng nội dung hoặc đánh rơi ảnh thì giữ bản gốc
-        if len(cleaned) < 0.3 * len(html):
-            log("   ! AI trả về quá ngắn, giữ bản gốc")
-            return html
-        if "<img" in html and "<img" not in cleaned:
-            log("   ! AI làm mất ảnh, giữ bản gốc")
-            return html
-        return cleaned
+        content = (data.get("content_html") or "").strip()
+        # Van an toàn: nếu Claude làm rỗng nội dung hoặc đánh rơi ảnh thì coi như hỏng
+        if len(strip_tags(content)) < 20:
+            log("   ! Claude trả về nội dung quá ngắn, dùng bản lọc cứng")
+            return None
+        if "<img" in html and "<img" not in content and not data.get("external_image_links"):
+            log("   ! Claude làm mất ảnh, dùng bản lọc cứng")
+            return None
+        return {
+            "title": (data.get("title") or "").strip(),
+            "content_html": content,
+            "external_image_links": data.get("external_image_links") or [],
+        }
     except Exception as e:
-        log(f"   ! Bước AI lỗi, giữ bản gốc: {e}")
-        return html
+        log(f"   ! Bước Claude lỗi, dùng bản lọc cứng: {e}")
+        return None
 
 
 # ---------- IMAP ----------
@@ -284,20 +345,37 @@ def main():
 
             title = clean_title(decode_mime(msg.get("Subject")))
             html, inline, attach = parse_email(msg)
-            html = html or ""
+            html = strip_forward_wrapper(html or "")
 
             html, featured = remap_inline_images(html, inline)
             html, featured = append_attached_images(html, attach, featured)
-            html = ai_cleanup(html)
 
-            # Van an toàn: thiếu tiêu đề hoặc thân quá ngắn thì hạ về draft
+            # Claude bóc nội dung sạch và nhận diện ảnh ngoài; nếu không dùng được
+            # thì rơi về bản đã lọc cứng ở trên.
+            external_links = []
+            ai = ai_extract(decode_mime(msg.get("Subject")), html)
+            if ai:
+                if ai["title"]:
+                    title = clean_title(ai["title"])
+                html = ai["content_html"]
+                external_links = ai["external_image_links"]
+
+            # Quyết định trạng thái
             status = POST_STATUS
+            reason = ""
             if not title or len(strip_tags(html)) < 20:
-                status = "draft"
-                log(f" - '{title or '(không tiêu đề)'}' nghi lỗi parse, hạ về draft")
+                status, reason = "draft", "thiếu tiêu đề hoặc nội dung quá ngắn"
+            elif external_links and featured is None:
+                # ảnh chỉ nằm ngoài (Drive...) và chưa nhúng được ảnh nào
+                if DRAFT_WHEN_IMAGES_EXTERNAL:
+                    status, reason = "draft", "ảnh nằm trong Drive, cần bỏ ảnh thủ công"
+                log(f"   . ảnh ngoài cần xử lý tay: {', '.join(external_links)}")
+
+            if reason:
+                log(f" - '{title or '(không tiêu đề)'}' -> draft: {reason}")
 
             if DRY_RUN:
-                log(f" - [DRY] sẽ đăng ({status}): {title[:70]}  | {len(inline)} ảnh inline, {len(attach)} đính kèm")
+                log(f" - [DRY] sẽ đăng ({status}): {title[:70]}  | nhúng được ảnh: {'có' if featured else 'không'}, ảnh ngoài: {len(external_links)}")
             else:
                 link = wp_create_post(title, html, status, featured, WP_CATEGORY_ID)
                 log(f" - đã đăng ({status}): {title[:70]}  -> {link}")
