@@ -265,9 +265,12 @@ def ai_extract(subject, html):
             "TUYỆT ĐỐI không viết lại, tóm tắt hay đổi câu chữ của phần nội dung thông cáo. "
             "Giữ nguyên các thẻ <img> cùng src đang có trong HTML.\n"
             "Nếu trong thư có link tới ảnh ngoài (Google Drive, Dropbox, link tải ảnh...), "
-            "hãy bỏ dòng chứa link đó khỏi nội dung và liệt kê link vào external_image_links.\n\n"
-            "Trả về DUY NHẤT một JSON, không thêm chữ nào, không bọc trong nháy code:\n"
-            '{"title": "...", "content_html": "...", "external_image_links": ["..."]}\n\n'
+            "hãy bỏ dòng chứa link đó khỏi nội dung và liệt kê link ở dòng DRIVE_LINKS.\n\n"
+            "Trả về CHÍNH XÁC theo định dạng sau, không thêm gì khác:\n"
+            "TITLE: <tiêu đề bài, một dòng>\n"
+            "DRIVE_LINKS: <các link ảnh ngoài, cách nhau bằng dấu phẩy, hoặc ghi none>\n"
+            "===CONTENT===\n"
+            "<phần HTML nội dung đã làm sạch, có thể nhiều dòng>\n\n"
             f"Tiêu đề email gốc: {subject}\n\nHTML:\n{html}"
         )
         resp = client.messages.create(
@@ -276,22 +279,37 @@ def ai_extract(subject, html):
             messages=[{"role": "user", "content": instruction}],
         )
         raw = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text").strip()
-        raw = re.sub(r"^```(?:json)?\s*", "", raw)
-        raw = re.sub(r"\s*```$", "", raw).strip()
-        data = json.loads(raw)
 
-        content = (data.get("content_html") or "").strip()
+        # Tách theo mốc ===CONTENT===: phần HTML nằm sau, chứa nháy/xuống dòng tùy ý đều được
+        marker = "===CONTENT==="
+        head, _, content = raw.partition(marker)
+        if not content:
+            head, content = "", raw  # không thấy mốc thì coi cả cụm là nội dung
+        content = re.sub(r"^\s*```(?:html)?\s*", "", content)
+        content = re.sub(r"\s*```\s*$", "", content).strip()
+
+        title = ""
+        links = []
+        for line in head.splitlines():
+            low = line.strip().lower()
+            if low.startswith("title:"):
+                title = line.split(":", 1)[1].strip()
+            elif low.startswith("drive_links:"):
+                val = line.split(":", 1)[1].strip()
+                if val and val.lower() != "none":
+                    links = [x.strip() for x in val.split(",") if x.strip()]
+
         # Van an toàn: nếu Claude làm rỗng nội dung hoặc đánh rơi ảnh thì coi như hỏng
         if len(strip_tags(content)) < 20:
             log("   ! Claude trả về nội dung quá ngắn, dùng bản lọc cứng")
             return None
-        if "<img" in html and "<img" not in content and not data.get("external_image_links"):
+        if "<img" in html and "<img" not in content and not links:
             log("   ! Claude làm mất ảnh, dùng bản lọc cứng")
             return None
         return {
-            "title": (data.get("title") or "").strip(),
+            "title": title,
             "content_html": content,
-            "external_image_links": data.get("external_image_links") or [],
+            "external_image_links": links,
         }
     except Exception as e:
         log(f"   ! Bước Claude lỗi, dùng bản lọc cứng: {e}")
