@@ -35,6 +35,12 @@ IMAP_PASS       = os.environ["IMAP_PASS"]
 IMAP_FOLDER     = _env("IMAP_FOLDER", "INBOX")
 PROCESSED_FOLDER = _env("PROCESSED_FOLDER", "")  # ví dụ "Done", để trống thì chỉ đánh dấu đã đọc
 
+# Lọc bằng cú pháp tìm kiếm của Gmail (X-GM-RAW). Mặc định chừa các thẻ Quảng cáo,
+# Mạng xã hội, Diễn đàn. Khi dùng nhãn riêng thì đổi thành "label:TenNhan is:unread".
+# Trên hộp mail KHÔNG phải Gmail, script tự quay về lọc UNSEEN thường.
+GMAIL_RAW_SEARCH = _env("GMAIL_RAW_SEARCH",
+                        "is:unread -category:promotions -category:social -category:forums")
+
 WP_URL          = os.environ["WP_URL"].strip().rstrip("/")
 WP_USER         = os.environ["WP_USER"].strip()
 WP_APP_PASSWORD = os.environ["WP_APP_PASSWORD"]  # không strip vì app password của WP có dấu cách
@@ -237,7 +243,7 @@ def mark_processed(imap, uid):
         return
     imap.uid("STORE", uid, "+FLAGS", r"(\Seen)")
     if PROCESSED_FOLDER:
-        res, _ = imap.uid("COPY", uid, PROCESSED_FOLDER)
+        res, _ = imap.uid("COPY", uid, f'"{PROCESSED_FOLDER}"')
         if res == "OK":
             imap.uid("STORE", uid, "+FLAGS", r"(\Deleted)")
             imap.expunge()
@@ -246,11 +252,26 @@ def mark_processed(imap, uid):
 def main():
     imap = imaplib.IMAP4_SSL(IMAP_HOST)
     imap.login(IMAP_USER, IMAP_PASS)
-    imap.select(IMAP_FOLDER)
+    imap.select(f'"{IMAP_FOLDER}"')
 
-    typ, data = imap.uid("SEARCH", None, "UNSEEN")
-    uids = data[0].split() if data and data[0] else []
-    log(f"Tìm thấy {len(uids)} mail mới trong '{IMAP_FOLDER}'."
+    uids = []
+    if GMAIL_RAW_SEARCH:
+        # Lọc theo cú pháp Gmail: chừa các thẻ không mong muốn (hoặc lọc theo nhãn).
+        try:
+            typ, data = imap.uid("SEARCH", "X-GM-RAW", f'"{GMAIL_RAW_SEARCH}"')
+            if typ != "OK":
+                raise imaplib.IMAP4.error(f"X-GM-RAW trả về {typ}")
+            uids = data[0].split() if data and data[0] else []
+            log(f"Lọc Gmail: {GMAIL_RAW_SEARCH}")
+        except Exception as e:
+            log(f"Lọc Gmail không dùng được ({e}), quay về lọc mail chưa đọc thường.")
+            typ, data = imap.uid("SEARCH", None, "UNSEEN")
+            uids = data[0].split() if data and data[0] else []
+    else:
+        typ, data = imap.uid("SEARCH", None, "UNSEEN")
+        uids = data[0].split() if data and data[0] else []
+
+    log(f"Tìm thấy {len(uids)} mail cần xử lý trong '{IMAP_FOLDER}'."
         + (" [DRY_RUN]" if DRY_RUN else ""))
 
     published = drafted = failed = 0
