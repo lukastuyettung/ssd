@@ -1,15 +1,10 @@
 name: TCBC len WordPress moi ngay
 
 on:
-  schedule:
-    # Cron chay theo gio UTC. 18:00 UTC = 01:00 sang hom sau o VN (UTC+7).
-    - cron: "0 18 * * *"
-  workflow_dispatch:        # nut bam chay tay de test
-    inputs:
-      dry_run:
-        description: "Chay thu khong dang bai (true/false)"
-        required: false
-        default: "false"
+  # Lich tu dong da tat. Bo dau thang o hai dong duoi de bat lai.
+  # schedule:
+  #   - cron: "0 18 * * *"   # 18:00 UTC = 01:00 sang hom sau o VN (UTC+7)
+  workflow_dispatch:          # chi chay khi bam nut Run workflow
 
 jobs:
   run:
@@ -40,4 +35,4 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           ANTHROPIC_MODEL:   ${{ secrets.ANTHROPIC_MODEL }}
           AI_CLEANUP:        ${{ secrets.AI_CLEANUP }}
-          DRY_RUN:           ${{ github.event.inputs.dry_run }}
+          DRY_RUN:           "false"
