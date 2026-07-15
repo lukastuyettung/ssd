@@ -243,6 +243,83 @@ def append_attached_images(html, attachments, featured):
     return html, featured
 
 
+# ---------- Nội dung nằm trong Google Docs ----------
+GDOC_RE = r"https?://docs\.google\.com/document/d/([\w\-]+)"
+
+
+def fetch_google_doc(doc_id):
+    """Tải nội dung một Google Doc đang ở chế độ ai-có-link-xem-được, dưới dạng HTML.
+    Trả về phần thân HTML, hoặc None nếu doc bị khóa hoặc tải lỗi."""
+    export = f"https://docs.google.com/document/d/{doc_id}/export?format=html"
+    try:
+        r = requests.get(export, headers={"User-Agent": "Mozilla/5.0"},
+                         timeout=60, allow_redirects=True)
+    except Exception as e:
+        log(f"   ! không tải được Google Doc: {e}")
+        return None
+    if r.status_code != 200 or "text/html" not in r.headers.get("Content-Type", ""):
+        log(f"   ! Google Doc không mở được (status {r.status_code}), có thể chưa chia sẻ công khai")
+        return None
+    if "accounts.google.com" in r.text or "Sign in" in r.text[:2000]:
+        log("   ! Google Doc đang yêu cầu đăng nhập, chưa để chế độ ai có link xem được")
+        return None
+    mb = re.search(r"<body[^>]*>(.*)</body>", r.text, flags=re.I | re.S)
+    return mb.group(1) if mb else r.text
+
+
+def remap_remote_images(html, featured=None):
+    """Tải các ảnh đang trỏ ra server ngoài (vd ảnh trong Google Doc) về Media Library
+    của WordPress rồi thay src. Trả về (html, featured)."""
+    seen = set()
+    for src in re.findall(r'<img[^>]+src="(https?://[^"]+)"', html, flags=re.I):
+        if src in seen or WP_URL in src:
+            continue
+        seen.add(src)
+        try:
+            r = requests.get(src, headers={"User-Agent": "Mozilla/5.0"}, timeout=60)
+            r.raise_for_status()
+            data, ctype = r.content, r.headers.get("Content-Type", "image/jpeg").split(";")[0]
+        except Exception as e:
+            log(f"   ! tải ảnh từ doc lỗi, bỏ qua: {e}")
+            continue
+        if not ctype.startswith("image/") or len(data) < MIN_IMAGE_BYTES:
+            continue
+        fname = ensure_ext((src.split("/")[-1].split("?")[0] or "image")[:40], ctype)
+        try:
+            media_id, url = wp_upload_media(fname, data, ctype)
+        except Exception as e:
+            log(f"   ! upload ảnh doc lỗi, bỏ qua: {e}")
+            continue
+        if featured is None:
+            featured = media_id
+        html = html.replace(f'"{src}"', f'"{url}"')
+    return html, featured
+
+
+# ---------- Nhúng video YouTube ----------
+YT_URL = (r"https?://(?:www\.)?(?:youtu\.be/[\w\-]+|"
+          r"youtube\.com/(?:watch\?v=|embed/|shorts/)[\w\-]+)(?:[?&][^\s\"<>]*)?")
+
+
+def build_embed_block(url):
+    return (
+        '<!-- wp:embed {"url":"' + url + '","type":"video","providerNameSlug":"youtube",'
+        '"responsive":true,"className":"wp-embed-aspect-16-9 wp-has-aspect-ratio"} -->\n'
+        '<figure class="wp-block-embed is-type-video is-provider-youtube '
+        'wp-block-embed-youtube wp-embed-aspect-16-9 wp-has-aspect-ratio">'
+        '<div class="wp-block-embed__wrapper">\n' + url + '\n</div></figure>\n'
+        '<!-- /wp:embed -->'
+    )
+
+
+def embed_videos(html):
+    """Đổi mỗi <p> chỉ chứa một link YouTube thành khối nhúng video của WordPress."""
+    if not html:
+        return html
+    pat = re.compile(r"<p>\s*(?:<a\b[^>]*>\s*)?(" + YT_URL + r")\s*(?:</a>\s*)?</p>", re.I)
+    return pat.sub(lambda m: build_embed_block(m.group(1)), html)
+
+
 # ---------- Xử lý bằng Claude: bóc nội dung + nhận diện ảnh ngoài ----------
 def ai_extract(subject, html):
     """Giao thân email cho Claude, nhận về tiêu đề sạch, nội dung sạch và
@@ -265,7 +342,9 @@ def ai_extract(subject, html):
             "TUYỆT ĐỐI không viết lại, tóm tắt hay đổi câu chữ của phần nội dung thông cáo. "
             "Giữ nguyên các thẻ <img> cùng src đang có trong HTML.\n"
             "Nếu trong thư có link tới ảnh ngoài (Google Drive, Dropbox, link tải ảnh...), "
-            "hãy bỏ dòng chứa link đó khỏi nội dung và liệt kê link ở dòng DRIVE_LINKS.\n\n"
+            "hãy bỏ dòng chứa link đó khỏi nội dung và liệt kê link ở dòng DRIVE_LINKS.\n"
+            "Nếu có link video YouTube, hãy đặt link đó nằm một mình trong một thẻ <p>, "
+            "bỏ nhãn kiểu 'Clip:...' phía trước, để hệ thống tự nhúng thành khung video.\n\n"
             "Trả về CHÍNH XÁC theo định dạng sau, không thêm gì khác:\n"
             "TITLE: <tiêu đề bài, một dòng>\n"
             "DRIVE_LINKS: <các link ảnh ngoài, cách nhau bằng dấu phẩy, hoặc ghi none>\n"
@@ -365,8 +444,20 @@ def main():
             html, inline, attach = parse_email(msg)
             html = strip_forward_wrapper(html or "")
 
-            html, featured = remap_inline_images(html, inline)
-            html, featured = append_attached_images(html, attach, featured)
+            # Nếu thông cáo nằm trong một Google Doc thì lấy nội dung từ đó
+            featured = None
+            used_doc = False
+            doc_ids = re.findall(GDOC_RE, html)
+            if doc_ids:
+                doc_html = fetch_google_doc(doc_ids[0])
+                if doc_html and len(strip_tags(doc_html)) >= 200:
+                    log(f"   . lấy nội dung từ Google Doc {doc_ids[0]}")
+                    html, featured = remap_remote_images(doc_html, featured)
+                    used_doc = True
+
+            if not used_doc:
+                html, featured = remap_inline_images(html, inline)
+                html, featured = append_attached_images(html, attach, featured)
 
             # Claude bóc nội dung sạch và nhận diện ảnh ngoài; nếu không dùng được
             # thì rơi về bản đã lọc cứng ở trên.
@@ -378,6 +469,7 @@ def main():
                 html = ai["content_html"]
                 external_links = ai["external_image_links"]
 
+            html = embed_videos(html)  # đổi link YouTube thành khung nhúng
             # Quyết định trạng thái
             status = POST_STATUS
             reason = ""
